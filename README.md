@@ -26,5 +26,5 @@ You can pull the latest image directly from the GitHub Container Registry:
 services:
   roundcube:
     image: ghcr.io/Kartoffelbauer/docker-roundcube-custom:latest-nonroot
-    # Rest of the docker file configuration...
+    # Rest of the configuration...
 ```
