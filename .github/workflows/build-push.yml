@@ -2,13 +2,13 @@ name: Build and Push
 
 on:
   schedule:
-    - cron: '0 3 * * 0' # Auto-build every Sunday at 03:00 AM
+    - cron: '0 3 * * 0' 
   push:
     branches: [ "main" ]
     paths:
       - 'Dockerfile'
       - 'plugins/**'
-  workflow_dispatch: # Allow manual triggering via GitHub UI
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -22,6 +22,7 @@ jobs:
       skip_build: ${{ steps.check.outputs.skip }}
       upstream_digest: ${{ steps.check.outputs.upstream_digest }}
       upstream_version: ${{ steps.check.outputs.upstream_version }}
+      upstream_minor_version: ${{ steps.check.outputs.upstream_minor_version }}
     steps:
       - name: Calculate lowercase image name
         id: set_vars
@@ -43,19 +44,36 @@ jobs:
           if [ -z "$UPSTREAM_VERSION" ]; then
             UPSTREAM_VERSION=$(skopeo inspect $UPSTREAM_IMAGE | jq -r '.Labels["org.opencontainers.image.version"] // "latest"')
           fi
-          echo "upstream_version=$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
+          
+          # 3. Extract the minor version (e.g., "1.6.6" becomes "1.6")
+          UPSTREAM_MINOR_VERSION=$(echo "$UPSTREAM_VERSION" | cut -d. -f1,2)
 
-          # 3. Get the label from our last build (fallback to 'none' on first run)
+          # 4. Get the label from our last build (fallback to 'none' on first run)
           OUR_DIGEST=$(skopeo inspect --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} $OUR_IMAGE | jq -r '.Labels["upstream_base_digest"]' || echo "none")
 
-          # 4. Compare digests. Skip only if they match AND it's a scheduled run.
+          # 5. Compare digests. Skip only if they match AND it's a scheduled run.
           if [ "$UPSTREAM_DIGEST" = "$OUR_DIGEST" ] && [ "${{ github.event_name }}" = "schedule" ]; then
             echo "No update found upstream. Skipping build."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Update found or manual trigger! Building version $UPSTREAM_VERSION..."
+            echo "Update found or manual trigger! Building versions $UPSTREAM_VERSION and $UPSTREAM_MINOR_VERSION..."
             echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "upstream_digest=$UPSTREAM_DIGEST" >> "$GITHUB_OUTPUT"
+            
+            # Export the variables securely using EOF
+            EOF1=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+            echo "upstream_digest<<$EOF1" >> "$GITHUB_OUTPUT"
+            echo "$UPSTREAM_DIGEST" >> "$GITHUB_OUTPUT"
+            echo "$EOF1" >> "$GITHUB_OUTPUT"
+            
+            EOF2=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+            echo "upstream_version<<$EOF2" >> "$GITHUB_OUTPUT"
+            echo "$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
+            echo "$EOF2" >> "$GITHUB_OUTPUT"
+            
+            EOF3=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+            echo "upstream_minor_version<<$EOF3" >> "$GITHUB_OUTPUT"
+            echo "$UPSTREAM_MINOR_VERSION" >> "$GITHUB_OUTPUT"
+            echo "$EOF3" >> "$GITHUB_OUTPUT"
           fi
 
   # --- Job 2: Build & Push ---
@@ -90,6 +108,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name }}
           tags: |
             type=raw,value=latest-nonroot
+            type=raw,value=${{ needs.prepare.outputs.upstream_minor_version }}-nonroot
             type=raw,value=${{ needs.prepare.outputs.upstream_version }}-nonroot
 
       - name: Build and push Docker image
@@ -98,9 +117,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          pull: true # Ensures we don't build on top of a stale cached base image
+          pull: true
           tags: ${{ steps.meta.outputs.tags }}
-          # Attach the upstream digest as a label for future comparison
           labels: |
             ${{ steps.meta.outputs.labels }}
             upstream_base_digest=${{ needs.prepare.outputs.upstream_digest }}
