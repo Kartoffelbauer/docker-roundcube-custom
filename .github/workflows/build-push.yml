@@ -15,13 +15,13 @@ env:
 
 jobs:
   # --- Job 1: Preparation & Smart Check ---
-  # Calculates variables and determines if a build is actually necessary
   prepare:
     runs-on: ubuntu-latest
     outputs:
       image_name: ${{ steps.set_vars.outputs.image_name }}
       skip_build: ${{ steps.check.outputs.skip }}
       upstream_digest: ${{ steps.check.outputs.upstream_digest }}
+      upstream_version: ${{ steps.check.outputs.upstream_version }}
     steps:
       - name: Calculate lowercase image name
         id: set_vars
@@ -36,21 +36,29 @@ jobs:
           # 1. Get current SHA256 digest of the official upstream image
           UPSTREAM_DIGEST=$(skopeo inspect $UPSTREAM_IMAGE | jq -r '.Digest')
 
-          # 2. Get the label from our last build (fallback to 'none' on first run)
+          # 2. Extract the exact Roundcube version from the upstream image config
+          UPSTREAM_VERSION=$(skopeo inspect --config $UPSTREAM_IMAGE | jq -r '.config.Env[]? | select(startswith("ROUNDCUBEMAIL_VERSION=")) | split("=")[1]' | head -n 1)
+          
+          # Fallback to standard OCI label if the env var is missing, or default to "latest"
+          if [ -z "$UPSTREAM_VERSION" ]; then
+            UPSTREAM_VERSION=$(skopeo inspect $UPSTREAM_IMAGE | jq -r '.Labels["org.opencontainers.image.version"] // "latest"')
+          fi
+          echo "upstream_version=$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
+
+          # 3. Get the label from our last build (fallback to 'none' on first run)
           OUR_DIGEST=$(skopeo inspect --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} $OUR_IMAGE | jq -r '.Labels["upstream_base_digest"]' || echo "none")
 
-          # 3. Compare digests. Skip only if they match AND it's a scheduled run.
+          # 4. Compare digests. Skip only if they match AND it's a scheduled run.
           if [ "$UPSTREAM_DIGEST" = "$OUR_DIGEST" ] && [ "${{ github.event_name }}" = "schedule" ]; then
             echo "No update found upstream. Skipping build."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Update found or manual trigger! Building..."
+            echo "Update found or manual trigger! Building version $UPSTREAM_VERSION..."
             echo "skip=false" >> "$GITHUB_OUTPUT"
             echo "upstream_digest=$UPSTREAM_DIGEST" >> "$GITHUB_OUTPUT"
           fi
 
   # --- Job 2: Build & Push ---
-  # Only executes if the 'prepare' job signals that an update or manual trigger occurred
   build:
     needs: prepare
     if: needs.prepare.outputs.skip_build == 'false'
@@ -80,7 +88,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name }}
-          tags: type=raw,value=latest-nonroot
+          tags: |
+            type=raw,value=latest-nonroot
+            type=raw,value=${{ needs.prepare.outputs.upstream_version }}-nonroot
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
