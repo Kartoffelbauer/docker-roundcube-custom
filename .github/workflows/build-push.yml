@@ -61,12 +61,12 @@ jobs:
           done
 
           # 4. Handle Codebase Updates
-          # Only force a rebuild of the latest tag if code was actually pushed to main.
-          # Scheduled and manual dispatches will exit silently if synced.
+          # Only force a rebuild if code was actually pushed to main.
           if [ ${#MISSING_VERSIONS[@]} -eq 0 ]; then
             if [ "${{ github.event_name }}" == "push" ]; then
-              echo "Codebase update detected. Rebuilding latest tag to apply changes."
-              MISSING_VERSIONS=("$ABSOLUTE_LATEST")
+              echo "Codebase update detected. Rebuilding the highest patch of every minor release."
+              # Converts the newline-separated string into a bash array
+              MISSING_VERSIONS=($HIGHEST_MINORS)
             else
               echo "Repository is perfectly synced. Exiting gracefully."
               echo "missing_tags=[]" >> "$GITHUB_OUTPUT"

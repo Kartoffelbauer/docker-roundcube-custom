@@ -12,7 +12,8 @@ RUN apt-get update && \
     aspell-en \
     aspell-de \
     && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && echo hi
 
 # Copy custom password driver alongside translation files into the image
 COPY ./plugins/password/drivers/gandi.php /usr/src/roundcubemail/plugins/password/drivers/gandi.php
