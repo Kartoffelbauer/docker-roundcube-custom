@@ -12,13 +12,12 @@ This custom image modifies the base Roundcube image with the following additions
 
 ## Automated Builds
 
-The build process is fully automated via GitHub Actions (`build-push.yml`) and is designed with strict state-aware polling to ensure no upstream releases are ever skipped.
+The build process is fully automated via GitHub Actions (`build-push.yml`) using a robust 1:1 synchronization pipeline to ensure perfect parity with upstream releases.
 
-* **State-Aware Polling:** Runs every Sunday at 03:00 AM. It fetches all semantic versions (`x.x.x-apache-nonroot`) from the upstream Docker Hub and compares them against the tags already published in this repository's GitHub Container Registry (GHCR).
-* **Dynamic Matrix Builds:** If multiple new versions (or backports) have been released upstream, the workflow dynamically generates a build matrix and concurrently builds all missing versions.
-* **Clean Semantic Tagging:** The workflow strictly validates base versions. When an image is built, it is automatically tagged with the patch version (`1.6.6-nonroot`), minor version (`1.6-nonroot`), and dynamically applies the `latest-nonroot` tag *only* to the absolute highest semantic version to prevent race conditions.
-* **Manual Overrides:** Supports manual execution via `workflow_dispatch`. You can input a specific semantic version (e.g., `1.6.6`) or type `latest` to forcefully rebuild a specific target. Strict input validation prevents malformed builds.
-* **Smart Push Triggers:** Automatically rebuilds the newest upstream tag if changes are pushed to the `Dockerfile`, configurations, or plugins to ensure code changes are deployed immediately.
+* **1:1 Mirror Synchronization:** Runs every Sunday at 03:00 AM. The workflow fetches all semantic versions (`x.x.x-apache-nonroot`) from upstream Docker Hub, compares them against the local GitHub Container Registry (GHCR), and dynamically queues a build matrix for any missing tags.
+* **Race-Condition Free Tagging:** When building multiple versions concurrently, the pipeline safely calculates and applies the `latest-nonroot` tag strictly to the highest overall version, and binds minor tags (e.g., `1.6-nonroot`) exclusively to the highest patch in that series, preventing concurrent build jobs from overwriting active tags.
+* **Smart Codebase Updates:** If changes are pushed to the `Dockerfile` or plugins, the workflow automatically triggers a rebuild of the highest patch for *every active minor release* (e.g., the latest 1.4.x, 1.5.x, and 1.6.x versions). This ensures your code changes are immediately propagated to the tags users actually rely on, without wasting resources rebuilding obsolete historical versions.
+* **Manual Synchronization:** Supports execution via `workflow_dispatch`. Triggering the workflow manually forces a fresh sync check; if the repository is already fully synced, it behaves identically to a codebase update and rebuilds the active minor branches.
 * **Multi-Architecture:** Builds seamlessly for both `linux/amd64` and `linux/arm64` platforms.
 
 ## Usage

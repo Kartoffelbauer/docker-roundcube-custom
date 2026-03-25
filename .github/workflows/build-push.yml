@@ -16,13 +16,16 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     outputs:
       image_name: ${{ steps.set_vars.outputs.image_name }}
       matrix_tags: ${{ steps.check.outputs.missing_tags }}
       latest_tag: ${{ steps.check.outputs.latest_tag }}
       highest_minors: ${{ steps.check.outputs.highest_minors }}
     steps:
-      # GHCR requires image repository names to be strictly lowercase
+      # GHCR requires repository namespaces to be strictly lowercase
       - name: Calculate lowercase image name
         id: set_vars
         run: echo "image_name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
@@ -30,7 +33,7 @@ jobs:
       - name: Calculate build matrix
         id: check
         run: |
-          # 1. Fetch Upstream Versions (Extract pure semantic version, e.g., '1.6.6')
+          # Extract pure semantic versions from upstream target tags
           UPSTREAM_VERSIONS=$(skopeo list-tags docker://roundcube/roundcubemail | jq -r '.Tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-apache-nonroot$")) | sub("-apache-nonroot$"; "")' | sort -V)
 
           if [ -z "$UPSTREAM_VERSIONS" ]; then
@@ -43,29 +46,25 @@ jobs:
 
           ABSOLUTE_LATEST=$(echo "$UPSTREAM_VERSIONS" | tail -n 1)
 
-          # Calculate highest patch for each minor version to prevent tag race conditions
-          # e.g., Reads [1.6.0, 1.6.1, 1.6.2] -> Outputs [1.6.2]
+          # Map the highest patch for each minor version to prevent race conditions during parallel matrix tagging
           HIGHEST_MINORS=$(echo "$UPSTREAM_VERSIONS" | awk -F. '{minor=$1"."$2; map[minor]=$0} END {for (i in map) print map[i]}' | sort -V)
           HIGHEST_MINORS_JSON=$(printf '%s\n' $HIGHEST_MINORS | jq -R . | jq -s -c .)
 
-          # 2. Fetch Local Versions (Suppressing errors on first run)
+          # Fetch local versions, suppressing errors on the initial run when the registry is empty
           OUR_VERSIONS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$")) | sub("-nonroot$"; "")' | sort -V || true)
 
           MISSING_VERSIONS=()
 
-          # 3. Calculate the Difference (1:1 Mirror logic)
+          # Identify versions not yet mirrored
           for up_ver in $UPSTREAM_VERSIONS; do
             if ! echo "$OUR_VERSIONS" | grep -qx "$up_ver"; then
               MISSING_VERSIONS+=("$up_ver")
             fi
           done
 
-          # 4. Handle Codebase Updates
-          # Only force a rebuild if code was actually pushed to main.
+          # Rebuild active minor releases if the source code (Dockerfile/plugins) changes
           if [ ${#MISSING_VERSIONS[@]} -eq 0 ]; then
             if [ "${{ github.event_name }}" == "push" ]; then
-              echo "Codebase update detected. Rebuilding the highest patch of every minor release."
-              # Converts the newline-separated string into a bash array
               MISSING_VERSIONS=($HIGHEST_MINORS)
             else
               echo "Repository is perfectly synced. Exiting gracefully."
@@ -74,7 +73,6 @@ jobs:
             fi
           fi
 
-          # 5. Export variables to the matrix
           JSON_ARRAY=$(printf '%s\n' "${MISSING_VERSIONS[@]}" | jq -R . | jq -s -c .)
           echo "missing_tags=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
           echo "highest_minors=$HIGHEST_MINORS_JSON" >> "$GITHUB_OUTPUT"
@@ -96,15 +94,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Extract minor version string (e.g., '1.6' from '1.6.6') with a fallback
       - name: Extract minor version for tagging
         id: version_logic
         run: |
           MINOR=$(echo "${{ matrix.version }}" | grep -oE '^[0-9]+\.[0-9]+' || true)
-          if [ -z "$MINOR" ]; then
-            echo "minor=${{ matrix.version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "minor=${MINOR}" >> "$GITHUB_OUTPUT"
-          fi
+          echo "minor=${MINOR:-${{ matrix.version }}}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to Container registry
         uses: docker/login-action@v3
@@ -119,7 +114,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Apply local suffix formatting with race-condition protection
+      # Conditionally apply 'latest' and minor tags only to their respective highest versions
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
@@ -130,7 +125,6 @@ jobs:
             type=raw,value=${{ steps.version_logic.outputs.minor }}-nonroot,enable=${{ contains(fromJson(needs.prepare.outputs.highest_minors), matrix.version) }}
             type=raw,value=latest-nonroot,enable=${{ matrix.version == needs.prepare.outputs.latest_tag }}
 
-      # Inject the upstream suffix for the FROM instruction
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
