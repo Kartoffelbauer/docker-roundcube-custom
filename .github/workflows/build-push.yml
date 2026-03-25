@@ -54,17 +54,10 @@ jobs:
             exit 0
           fi
 
-          ABSOLUTE_LATEST=$(echo "$UPSTREAM_VERSIONS" | tail -n 1)
+          ABSOLUTE_UPSTREAM_LATEST=$(echo "$UPSTREAM_VERSIONS" | tail -n 1)
 
           if [ "$FORCE_TAG" == "latest" ]; then
-            FORCE_TAG=$ABSOLUTE_LATEST
-          fi
-
-          # Override matrix with manual input if provided
-          if [ -n "$FORCE_TAG" ]; then
-            echo "missing_tags=[\"$FORCE_TAG\"]" >> "$GITHUB_OUTPUT"
-            echo "latest_tag=$ABSOLUTE_LATEST" >> "$GITHUB_OUTPUT"
-            exit 0
+            FORCE_TAG=$ABSOLUTE_UPSTREAM_LATEST
           fi
 
           # Extract pure semantic versions from our existing 'x.x.x-nonroot' tags
@@ -72,35 +65,47 @@ jobs:
 
           MISSING_VERSIONS=()
 
-          # Find all upstream versions >= our oldest built version that have not been mirrored yet
-          if [ -z "$OUR_VERSIONS" ]; then
-            MISSING_VERSIONS+=("$ABSOLUTE_LATEST")
+          # Determine the build queue
+          if [ -n "$FORCE_TAG" ]; then
+            # Manual override path
+            MISSING_VERSIONS+=("$FORCE_TAG")
           else
-            OLDEST_OUR_VER=$(echo "$OUR_VERSIONS" | head -n 1)
-
-            for up_ver in $UPSTREAM_VERSIONS; do
-              LOWEST=$(echo -e "$up_ver\n$OLDEST_OUR_VER" | sort -V | head -n 1)
-              if [ "$LOWEST" == "$OLDEST_OUR_VER" ]; then
-                if ! echo "$OUR_VERSIONS" | grep -qx "$up_ver"; then
-                  MISSING_VERSIONS+=("$up_ver")
-                fi
-              fi
-            done
-          fi
-
-          # Force a rebuild of the latest version on codebase changes if no new upstream tags exist
-          if [ ${#MISSING_VERSIONS[@]} -eq 0 ]; then
-            if [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-              MISSING_VERSIONS=("$ABSOLUTE_LATEST")
+            # Automated synchronization path
+            if [ -z "$OUR_VERSIONS" ]; then
+              MISSING_VERSIONS+=("$ABSOLUTE_UPSTREAM_LATEST")
             else
-              echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
-              exit 0
+              OLDEST_OUR_VER=$(echo "$OUR_VERSIONS" | head -n 1)
+
+              for up_ver in $UPSTREAM_VERSIONS; do
+                LOWEST=$(echo -e "$up_ver\n$OLDEST_OUR_VER" | sort -V | head -n 1)
+                if [ "$LOWEST" == "$OLDEST_OUR_VER" ]; then
+                  if ! echo "$OUR_VERSIONS" | grep -qx "$up_ver"; then
+                    MISSING_VERSIONS+=("$up_ver")
+                  fi
+                fi
+              done
+            fi
+
+            # Force a rebuild of our highest local version on codebase changes if no new tags exist
+            if [ ${#MISSING_VERSIONS[@]} -eq 0 ]; then
+              if [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+                HIGHEST_OUR_VER=$(echo "$OUR_VERSIONS" | tail -n 1)
+                MISSING_VERSIONS+=("${HIGHEST_OUR_VER:-$ABSOLUTE_UPSTREAM_LATEST}")
+              else
+                echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
             fi
           fi
 
+          # Calculate the definitive highest local version (existing + newly built)
+          # grep -v '^$' safely removes any empty string anomalies during concatenation
+          COMBINED_VERSIONS=$(echo -e "${OUR_VERSIONS}\n$(printf '%s\n' "${MISSING_VERSIONS[@]}")" | grep -v '^$' | sort -V)
+          LOCAL_LATEST=$(echo "$COMBINED_VERSIONS" | tail -n 1)
+
           JSON_ARRAY=$(printf '%s\n' "${MISSING_VERSIONS[@]}" | jq -R . | jq -s -c .)
           echo "missing_tags=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
-          echo "latest_tag=$ABSOLUTE_LATEST" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=$LOCAL_LATEST" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
