@@ -14,8 +14,8 @@ This custom image modifies the base Roundcube image with the following additions
 
 The build process is fully automated via GitHub Actions (`build-push.yml`) using a robust 1:1 synchronization pipeline to ensure perfect parity with upstream releases.
 
-* **1:1 Mirror Synchronization:** Runs every Sunday at 03:00 AM. The workflow fetches all semantic versions (`x.x.x-apache-nonroot`) from upstream Docker Hub, compares them against the local GitHub Container Registry (GHCR), and dynamically queues a build matrix for any missing tags.
-* **Smart Codebase Updates:** If changes are pushed to the `Dockerfile` or plugins, the workflow automatically triggers a rebuild of the highest patch for *every active minor release* (e.g., the latest 1.4.x, 1.5.x, and 1.6.x versions).
+* **1:1 Mirror Synchronization:** Runs every Sunday at 03:00 AM. The workflow builds images for all semantic versions (`x.x.x-apache-nonroot`) from the upstream Docker Hub
+* **Smart Codebase Updates:** If changes are pushed to the `Dockerfile` or plugins, the workflow automatically triggers a rebuild of the highest patch for *every active minor release*
 * **Multi-Architecture:** Builds seamlessly for both `linux/amd64` and `linux/arm64` platforms.
 
 ## Usage
