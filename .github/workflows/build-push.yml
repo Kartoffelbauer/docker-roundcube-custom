@@ -38,17 +38,26 @@ jobs:
           if [ "${{ github.event.inputs.force_tag }}" != "" ]; then
             echo "Manual override detected. Building only: ${{ github.event.inputs.force_tag }}"
             echo "missing_tags=[\"${{ github.event.inputs.force_tag }}\"]" >> "$GITHUB_OUTPUT"
-            # Do not tag forced legacy builds as 'latest-nonroot'
             echo "latest_tag=none" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # 1. Fetch Upstream Tags (Regex ensures only true semantic versions ending in -nonroot)
-          UPSTREAM_TAGS=$(skopeo list-tags docker://roundcube/roundcubemail | jq -r '.Tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$"))' | sort -V)
+          # 1. Fetch Upstream Tags
+          # Regex updated to optionally match '-apache' (e.g., 1.6.6-apache-nonroot or 1.6.6-nonroot)
+          UPSTREAM_TAGS=$(skopeo list-tags docker://roundcube/roundcubemail | jq -r '.Tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+(-apache)?-nonroot$"))' | sort -V)
+
+          # SAFETY NET 1: Abort cleanly if upstream tags are entirely missing
+          if [ -z "$UPSTREAM_TAGS" ]; then
+            echo "Warning: No versioned nonroot tags found upstream. Roundcube may have changed their tagging scheme."
+            echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
+            echo "latest_tag=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           ABSOLUTE_LATEST=$(echo "$UPSTREAM_TAGS" | tail -n 1)
 
-          # 2. Fetch Our GHCR Tags (Using authenticated Skopeo, suppressing errors on first run)
-          OUR_TAGS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$"))' | sort -V || true)
+          # 2. Fetch Our GHCR Tags
+          OUR_TAGS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+(-apache)?-nonroot$"))' | sort -V || true)
 
           MISSING_TAGS=()
 
@@ -76,8 +85,9 @@ jobs:
 
           # 4. Handle direct pushes to main (e.g., Dockerfile changes)
           if [ ${#MISSING_TAGS[@]} -eq 0 ]; then
-            if [ "${{ github.event_name }}" == "push" ]; then
-              echo "Push detected but no new upstream tags. Rebuilding newest tag: $ABSOLUTE_LATEST"
+            # If triggered by a manual workflow dispatch without a force_tag, treat it like a push
+            if [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+              echo "Push/Dispatch detected but no new upstream tags. Rebuilding newest tag: $ABSOLUTE_LATEST"
               MISSING_TAGS=("$ABSOLUTE_LATEST")
             else
               echo "No new upstream versions missing. Exiting gracefully."
@@ -112,9 +122,15 @@ jobs:
       - name: Extract Minor Version for Tagging
         id: version_logic
         run: |
-          # Converts "1.6.6-nonroot" into "1.6-nonroot"
-          MINOR=$(echo "${{ matrix.tag }}" | grep -oE '^[0-9]+\.[0-9]+')
-          echo "minor_tag=${MINOR}-nonroot" >> "$GITHUB_OUTPUT"
+          # SAFETY NET 2: The '|| true' prevents grep from exiting with code 1 and crashing the runner
+          MINOR=$(echo "${{ matrix.tag }}" | grep -oE '^[0-9]+\.[0-9]+' || true)
+
+          # SAFETY NET 3: Fallback if grep completely fails
+          if [ -z "$MINOR" ]; then
+            echo "minor_tag=${{ matrix.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "minor_tag=${MINOR}-nonroot" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Log in to Container registry
         uses: docker/login-action@v3
