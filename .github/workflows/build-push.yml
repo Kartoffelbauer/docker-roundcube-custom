@@ -8,12 +8,7 @@ on:
     paths:
       - 'Dockerfile'
       - 'plugins/**'
-  workflow_dispatch:
-    inputs:
-      force_tag:
-        description: 'Force build version (e.g. 1.6.6 or latest)'
-        required: false
-        type: string
+  workflow_dispatch: # Manual triggers no longer require inputs
 
 env:
   REGISTRY: ghcr.io
@@ -34,17 +29,7 @@ jobs:
       - name: Calculate build matrix
         id: check
         run: |
-          FORCE_TAG="${{ github.event.inputs.force_tag }}"
-
-          # Validate manual inputs to prevent injection or malformed requests
-          if [ -n "$FORCE_TAG" ]; then
-            if [[ ! "$FORCE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$FORCE_TAG" != "latest" ]]; then
-              echo "Error: Invalid input. Must be a semantic version (e.g., 1.6.6) or 'latest'."
-              exit 1
-            fi
-          fi
-
-          # Extract pure semantic versions from upstream 'x.x.x-apache-nonroot' tags
+          # 1. Fetch Upstream Versions (Extract pure semantic version, e.g., '1.6.6')
           UPSTREAM_VERSIONS=$(skopeo list-tags docker://roundcube/roundcubemail | jq -r '.Tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-apache-nonroot$")) | sub("-apache-nonroot$"; "")' | sort -V)
 
           if [ -z "$UPSTREAM_VERSIONS" ]; then
@@ -54,58 +39,38 @@ jobs:
             exit 0
           fi
 
-          ABSOLUTE_UPSTREAM_LATEST=$(echo "$UPSTREAM_VERSIONS" | tail -n 1)
+          ABSOLUTE_LATEST=$(echo "$UPSTREAM_VERSIONS" | tail -n 1)
 
-          if [ "$FORCE_TAG" == "latest" ]; then
-            FORCE_TAG=$ABSOLUTE_UPSTREAM_LATEST
-          fi
-
-          # Extract pure semantic versions from our existing 'x.x.x-nonroot' tags
+          # 2. Fetch Local Versions (Extract pure semantic version, suppressing errors on first run)
           OUR_VERSIONS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$")) | sub("-nonroot$"; "")' | sort -V || true)
 
           MISSING_VERSIONS=()
 
-          # Determine the build queue
-          if [ -n "$FORCE_TAG" ]; then
-            # Manual override path
-            MISSING_VERSIONS+=("$FORCE_TAG")
-          else
-            # Automated synchronization path
-            if [ -z "$OUR_VERSIONS" ]; then
-              MISSING_VERSIONS+=("$ABSOLUTE_UPSTREAM_LATEST")
-            else
-              OLDEST_OUR_VER=$(echo "$OUR_VERSIONS" | head -n 1)
-
-              for up_ver in $UPSTREAM_VERSIONS; do
-                LOWEST=$(echo -e "$up_ver\n$OLDEST_OUR_VER" | sort -V | head -n 1)
-                if [ "$LOWEST" == "$OLDEST_OUR_VER" ]; then
-                  if ! echo "$OUR_VERSIONS" | grep -qx "$up_ver"; then
-                    MISSING_VERSIONS+=("$up_ver")
-                  fi
-                fi
-              done
+          # 3. Calculate the Difference (1:1 Mirror logic)
+          for up_ver in $UPSTREAM_VERSIONS; do
+            if ! echo "$OUR_VERSIONS" | grep -qx "$up_ver"; then
+              MISSING_VERSIONS+=("$up_ver")
             fi
+          done
 
-            # Force a rebuild of our highest local version on codebase changes if no new tags exist
-            if [ ${#MISSING_VERSIONS[@]} -eq 0 ]; then
-              if [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-                HIGHEST_OUR_VER=$(echo "$OUR_VERSIONS" | tail -n 1)
-                MISSING_VERSIONS+=("${HIGHEST_OUR_VER:-$ABSOLUTE_UPSTREAM_LATEST}")
-              else
-                echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
+          # 4. Handle Codebase Updates (Rebuild 'latest' if code changed but upstream didn't)
+          if [ ${#MISSING_VERSIONS[@]} -eq 0 ]; then
+            if [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+              echo "Codebase update or manual dispatch detected. Rebuilding latest tag."
+              MISSING_VERSIONS=("$ABSOLUTE_LATEST")
+            else
+              echo "Everything is up to date. Exiting gracefully."
+              echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
           fi
 
-          # Calculate the definitive highest local version (existing + newly built)
-          # grep -v '^$' safely removes any empty string anomalies during concatenation
-          COMBINED_VERSIONS=$(echo -e "${OUR_VERSIONS}\n$(printf '%s\n' "${MISSING_VERSIONS[@]}")" | grep -v '^$' | sort -V)
-          LOCAL_LATEST=$(echo "$COMBINED_VERSIONS" | tail -n 1)
-
+          # 5. Export variables to the matrix
           JSON_ARRAY=$(printf '%s\n' "${MISSING_VERSIONS[@]}" | jq -R . | jq -s -c .)
           echo "missing_tags=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
-          echo "latest_tag=$LOCAL_LATEST" >> "$GITHUB_OUTPUT"
+
+          # In a full mirror, the highest upstream version is always the definitive 'latest'
+          echo "latest_tag=$ABSOLUTE_LATEST" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -146,7 +111,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Re-apply suffixes to form the final downstream tags
+      # Apply local suffix formatting
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
@@ -157,7 +122,7 @@ jobs:
             type=raw,value=${{ steps.version_logic.outputs.minor_tag }}-nonroot
             type=raw,value=latest-nonroot,enable=${{ matrix.version == needs.prepare.outputs.latest_tag }}
 
-      # Inject the upstream suffix dynamically for the FROM instruction in Dockerfile
+      # Inject the upstream suffix for the FROM instruction
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
