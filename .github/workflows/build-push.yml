@@ -8,7 +8,7 @@ on:
     paths:
       - 'Dockerfile'
       - 'plugins/**'
-  workflow_dispatch: # Manual triggers no longer require inputs
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -20,6 +20,7 @@ jobs:
       image_name: ${{ steps.set_vars.outputs.image_name }}
       matrix_tags: ${{ steps.check.outputs.missing_tags }}
       latest_tag: ${{ steps.check.outputs.latest_tag }}
+      highest_minors: ${{ steps.check.outputs.highest_minors }}
     steps:
       # GHCR requires image repository names to be strictly lowercase
       - name: Calculate lowercase image name
@@ -35,13 +36,19 @@ jobs:
           if [ -z "$UPSTREAM_VERSIONS" ]; then
             echo "Error: No valid upstream tags found."
             echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
+            echo "highest_minors=[]" >> "$GITHUB_OUTPUT"
             echo "latest_tag=none" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           ABSOLUTE_LATEST=$(echo "$UPSTREAM_VERSIONS" | tail -n 1)
 
-          # 2. Fetch Local Versions (Extract pure semantic version, suppressing errors on first run)
+          # Calculate highest patch for each minor version to prevent tag race conditions
+          # e.g., Reads [1.6.0, 1.6.1, 1.6.2] -> Outputs [1.6.2]
+          HIGHEST_MINORS=$(echo "$UPSTREAM_VERSIONS" | awk -F. '{minor=$1"."$2; map[minor]=$0} END {for (i in map) print map[i]}' | sort -V)
+          HIGHEST_MINORS_JSON=$(printf '%s\n' $HIGHEST_MINORS | jq -R . | jq -s -c .)
+
+          # 2. Fetch Local Versions (Suppressing errors on first run)
           OUR_VERSIONS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$")) | sub("-nonroot$"; "")' | sort -V || true)
 
           MISSING_VERSIONS=()
@@ -53,13 +60,15 @@ jobs:
             fi
           done
 
-          # 4. Handle Codebase Updates (Rebuild 'latest' if code changed but upstream didn't)
+          # 4. Handle Codebase Updates
+          # Only force a rebuild of the latest tag if code was actually pushed to main.
+          # Scheduled and manual dispatches will exit silently if synced.
           if [ ${#MISSING_VERSIONS[@]} -eq 0 ]; then
-            if [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-              echo "Codebase update or manual dispatch detected. Rebuilding latest tag."
+            if [ "${{ github.event_name }}" == "push" ]; then
+              echo "Codebase update detected. Rebuilding latest tag to apply changes."
               MISSING_VERSIONS=("$ABSOLUTE_LATEST")
             else
-              echo "Everything is up to date. Exiting gracefully."
+              echo "Repository is perfectly synced. Exiting gracefully."
               echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -68,8 +77,7 @@ jobs:
           # 5. Export variables to the matrix
           JSON_ARRAY=$(printf '%s\n' "${MISSING_VERSIONS[@]}" | jq -R . | jq -s -c .)
           echo "missing_tags=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
-
-          # In a full mirror, the highest upstream version is always the definitive 'latest'
+          echo "highest_minors=$HIGHEST_MINORS_JSON" >> "$GITHUB_OUTPUT"
           echo "latest_tag=$ABSOLUTE_LATEST" >> "$GITHUB_OUTPUT"
 
   build:
@@ -93,9 +101,9 @@ jobs:
         run: |
           MINOR=$(echo "${{ matrix.version }}" | grep -oE '^[0-9]+\.[0-9]+' || true)
           if [ -z "$MINOR" ]; then
-            echo "minor_tag=${{ matrix.version }}" >> "$GITHUB_OUTPUT"
+            echo "minor=${{ matrix.version }}" >> "$GITHUB_OUTPUT"
           else
-            echo "minor_tag=${MINOR}" >> "$GITHUB_OUTPUT"
+            echo "minor=${MINOR}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Log in to Container registry
@@ -111,7 +119,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Apply local suffix formatting
+      # Apply local suffix formatting with race-condition protection
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
@@ -119,7 +127,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name }}
           tags: |
             type=raw,value=${{ matrix.version }}-nonroot
-            type=raw,value=${{ steps.version_logic.outputs.minor_tag }}-nonroot
+            type=raw,value=${{ steps.version_logic.outputs.minor }}-nonroot,enable=${{ contains(fromJson(needs.prepare.outputs.highest_minors), matrix.version) }}
             type=raw,value=latest-nonroot,enable=${{ matrix.version == needs.prepare.outputs.latest_tag }}
 
       # Inject the upstream suffix for the FROM instruction
