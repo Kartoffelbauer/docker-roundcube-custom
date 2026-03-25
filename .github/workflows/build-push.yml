@@ -48,7 +48,7 @@ jobs:
           ABSOLUTE_LATEST=$(echo "$UPSTREAM_TAGS" | tail -n 1)
 
           # 2. Fetch Our GHCR Tags (Using authenticated Skopeo, suppressing errors on first run)
-          OUR_TAGS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty' | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$")) | sort -V || true)
+          OUR_TAGS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$"))' | sort -V || true)
 
           MISSING_TAGS=()
 
