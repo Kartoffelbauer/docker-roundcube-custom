@@ -19,7 +19,6 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  # --- Job 1: Find Missing Versions ---
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -27,30 +26,29 @@ jobs:
       matrix_tags: ${{ steps.check.outputs.missing_tags }}
       latest_tag: ${{ steps.check.outputs.latest_tag }}
     steps:
+      # GHCR requires image repository names to be strictly lowercase
       - name: Calculate lowercase image name
         id: set_vars
         run: echo "image_name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch and Compare Tags
+      - name: Calculate build matrix
         id: check
         run: |
           FORCE_TAG="${{ github.event.inputs.force_tag }}"
 
-          # 0. Input Validation for Manual Triggers
+          # Validate manual inputs to prevent injection or malformed requests
           if [ -n "$FORCE_TAG" ]; then
             if [[ ! "$FORCE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ "$FORCE_TAG" != "latest" ]]; then
               echo "Error: Invalid input. Must be a semantic version (e.g., 1.6.6) or 'latest'."
               exit 1
             fi
-            echo "Manual override detected for: $FORCE_TAG"
           fi
 
-          # 1. Fetch Upstream Base Versions
-          # jq strips '-apache-nonroot' immediately so we only deal with '1.6.6'
+          # Extract pure semantic versions from upstream 'x.x.x-apache-nonroot' tags
           UPSTREAM_VERSIONS=$(skopeo list-tags docker://roundcube/roundcubemail | jq -r '.Tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-apache-nonroot$")) | sub("-apache-nonroot$"; "")' | sort -V)
 
           if [ -z "$UPSTREAM_VERSIONS" ]; then
-            echo "Warning: No valid '-apache-nonroot' tags found upstream."
+            echo "Error: No valid upstream tags found."
             echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
             echo "latest_tag=none" >> "$GITHUB_OUTPUT"
             exit 0
@@ -58,65 +56,52 @@ jobs:
 
           ABSOLUTE_LATEST=$(echo "$UPSTREAM_VERSIONS" | tail -n 1)
 
-          # Handle 'latest' manual input dynamically
           if [ "$FORCE_TAG" == "latest" ]; then
-            echo "Resolving 'latest' to actual version: $ABSOLUTE_LATEST"
             FORCE_TAG=$ABSOLUTE_LATEST
           fi
 
-          # If manual override is active, queue it and exit
+          # Override matrix with manual input if provided
           if [ -n "$FORCE_TAG" ]; then
             echo "missing_tags=[\"$FORCE_TAG\"]" >> "$GITHUB_OUTPUT"
             echo "latest_tag=none" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # 2. Fetch Our GHCR Base Versions
-          # jq strips '-nonroot' immediately
+          # Extract pure semantic versions from our existing 'x.x.x-nonroot' tags
           OUR_VERSIONS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$")) | sub("-nonroot$"; "")' | sort -V || true)
 
           MISSING_VERSIONS=()
 
-          # 3. Apply the Versioning Logic (Comparing pure base versions)
+          # Find all upstream versions >= our oldest built version that have not been mirrored yet
           if [ -z "$OUR_VERSIONS" ]; then
-            echo "No previous builds found. Building initial latest version: $ABSOLUTE_LATEST"
             MISSING_VERSIONS+=("$ABSOLUTE_LATEST")
           else
             OLDEST_OUR_VER=$(echo "$OUR_VERSIONS" | head -n 1)
-            echo "Oldest built version is: $OLDEST_OUR_VER"
 
             for up_ver in $UPSTREAM_VERSIONS; do
-              # Determine if upstream version is >= our oldest version
               LOWEST=$(echo -e "$up_ver\n$OLDEST_OUR_VER" | sort -V | head -n 1)
-
               if [ "$LOWEST" == "$OLDEST_OUR_VER" ]; then
                 if ! echo "$OUR_VERSIONS" | grep -qx "$up_ver"; then
-                  echo "Queuing missing valid release: $up_ver"
                   MISSING_VERSIONS+=("$up_ver")
                 fi
               fi
             done
           fi
 
-          # 4. Handle direct pushes / workflow dispatches
+          # Force a rebuild of the latest version on codebase changes if no new upstream tags exist
           if [ ${#MISSING_VERSIONS[@]} -eq 0 ]; then
             if [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-              echo "Push/Dispatch detected but no new upstream tags. Rebuilding newest tag: $ABSOLUTE_LATEST"
               MISSING_VERSIONS=("$ABSOLUTE_LATEST")
             else
-              echo "No new upstream versions missing. Exiting gracefully."
               echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
               exit 0
             fi
           fi
 
-          # 5. Export JSON array
           JSON_ARRAY=$(printf '%s\n' "${MISSING_VERSIONS[@]}" | jq -R . | jq -s -c .)
-          echo "Final matrix payload: $JSON_ARRAY"
           echo "missing_tags=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
           echo "latest_tag=$ABSOLUTE_LATEST" >> "$GITHUB_OUTPUT"
 
-  # --- Job 2: Matrix Build & Push ---
   build:
     needs: prepare
     if: needs.prepare.outputs.matrix_tags != '[]'
@@ -126,7 +111,6 @@ jobs:
       packages: write
     strategy:
       matrix:
-        # The matrix tag here is the PURE BASE VERSION (e.g., 1.6.6)
         version: ${{ fromJson(needs.prepare.outputs.matrix_tags) }}
       fail-fast: false
 
@@ -134,10 +118,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Process Tag Formats
+      - name: Extract minor version for tagging
         id: version_logic
         run: |
-          # 1. Calculate Minor Version (Extracts "1.6" from "1.6.6")
           MINOR=$(echo "${{ matrix.version }}" | grep -oE '^[0-9]+\.[0-9]+' || true)
           if [ -z "$MINOR" ]; then
             echo "minor_tag=${{ matrix.version }}" >> "$GITHUB_OUTPUT"
@@ -158,17 +141,18 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Re-apply suffixes to form the final downstream tags
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name }}
-          # Apply suffixes only at the very end
           tags: |
             type=raw,value=${{ matrix.version }}-nonroot
             type=raw,value=${{ steps.version_logic.outputs.minor_tag }}-nonroot
             type=raw,value=latest-nonroot,enable=${{ matrix.version == needs.prepare.outputs.latest_tag }}
 
+      # Inject the upstream suffix dynamically for the FROM instruction in Dockerfile
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -176,7 +160,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           pull: true
-          # Construct the upstream target by appending the required suffix
           build-args: |
             UPSTREAM_VERSION=${{ matrix.version }}-apache-nonroot
           tags: ${{ steps.meta.outputs.tags }}
