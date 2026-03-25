@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       force_tag:
-        description: 'Force build a specific tag (e.g. 1.6.6-apache-nonroot)'
+        description: 'Force build a specific tag (e.g. latest-apache-nonroot)'
         required: false
         type: string
 
@@ -34,10 +34,14 @@ jobs:
       - name: Fetch and Compare Tags
         id: check
         run: |
-          # 0. Handle manual force-build trigger
+          # 0. Handle manual force-build trigger (Input is expected as upstream tag, e.g. 1.6.6-apache-nonroot)
           if [ -n "${{ github.event.inputs.force_tag }}" ]; then
-            echo "Manual override detected. Building only: ${{ github.event.inputs.force_tag }}"
-            echo "missing_tags=[\"${{ github.event.inputs.force_tag }}\"]" >> "$GITHUB_OUTPUT"
+            echo "Manual override detected."
+            # Convert upstream input to our downstream naming convention
+            DOWNSTREAM_FORCE_TAG=$(echo "${{ github.event.inputs.force_tag }}" | sed 's/-apache-nonroot/-nonroot/')
+            echo "Building only: $DOWNSTREAM_FORCE_TAG"
+
+            echo "missing_tags=[\"$DOWNSTREAM_FORCE_TAG\"]" >> "$GITHUB_OUTPUT"
             echo "latest_tag=none" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -52,30 +56,39 @@ jobs:
             exit 0
           fi
 
-          ABSOLUTE_LATEST=$(echo "$UPSTREAM_TAGS" | tail -n 1)
-
-          # 2. Fetch Our GHCR Tags
-          OUR_TAGS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-apache-nonroot$"))' | sort -V || true)
+          # 2. Fetch Our GHCR Tags (Strictly matching our downstream x.x.x-nonroot format)
+          OUR_TAGS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$"))' | sort -V || true)
 
           MISSING_TAGS=()
 
+          # Helper function to convert tags safely
+          to_downstream() { echo "$1" | sed 's/-apache-nonroot/-nonroot/'; }
+          to_upstream() { echo "$1" | sed 's/-nonroot/-apache-nonroot/'; }
+
+          # The absolute latest upstream tag, converted to our format for reference
+          ABSOLUTE_LATEST_UPSTREAM=$(echo "$UPSTREAM_TAGS" | tail -n 1)
+          ABSOLUTE_LATEST_DOWNSTREAM=$(to_downstream "$ABSOLUTE_LATEST_UPSTREAM")
+
           # 3. Apply the Versioning Logic
           if [ -z "$OUR_TAGS" ]; then
-            echo "No previous builds found in GHCR. Building initial latest version: $ABSOLUTE_LATEST"
-            MISSING_TAGS+=("$ABSOLUTE_LATEST")
+            echo "No previous builds found in GHCR. Building initial latest version: $ABSOLUTE_LATEST_DOWNSTREAM"
+            MISSING_TAGS+=("$ABSOLUTE_LATEST_DOWNSTREAM")
           else
             OLDEST_OUR_TAG=$(echo "$OUR_TAGS" | head -n 1)
-            echo "Oldest built version in GHCR is: $OLDEST_OUR_TAG"
+            # We must convert our oldest tag BACK to upstream format to compare properly against upstream tags
+            OLDEST_UPSTREAM_COMPARISON=$(to_upstream "$OLDEST_OUR_TAG")
+            echo "Oldest built version in GHCR is: $OLDEST_OUR_TAG (Upstream equivalent: $OLDEST_UPSTREAM_COMPARISON)"
 
-            for tag in $UPSTREAM_TAGS; do
+            for upstream_tag in $UPSTREAM_TAGS; do
               # Determine if upstream tag is >= our oldest tag
-              LOWEST=$(echo -e "$tag\n$OLDEST_OUR_TAG" | sort -V | head -n 1)
+              LOWEST=$(echo -e "$upstream_tag\n$OLDEST_UPSTREAM_COMPARISON" | sort -V | head -n 1)
 
-              if [ "$LOWEST" == "$OLDEST_OUR_TAG" ]; then
-                # Tag is in our valid window. Queue if not yet built.
-                if ! echo "$OUR_TAGS" | grep -qx "$tag"; then
-                  echo "Queuing missing valid release: $tag"
-                  MISSING_TAGS+=("$tag")
+              if [ "$LOWEST" == "$OLDEST_UPSTREAM_COMPARISON" ]; then
+                # Tag is in our valid window. Convert to our format and queue if not yet built.
+                downstream_tag=$(to_downstream "$upstream_tag")
+                if ! echo "$OUR_TAGS" | grep -qx "$downstream_tag"; then
+                  echo "Queuing missing valid release: $downstream_tag"
+                  MISSING_TAGS+=("$downstream_tag")
                 fi
               fi
             done
@@ -84,8 +97,8 @@ jobs:
           # 4. Handle direct pushes to main / workflow dispatches
           if [ ${#MISSING_TAGS[@]} -eq 0 ]; then
             if [ "${{ github.event_name }}" == "push" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-              echo "Push/Dispatch detected but no new upstream tags. Rebuilding newest tag: $ABSOLUTE_LATEST"
-              MISSING_TAGS=("$ABSOLUTE_LATEST")
+              echo "Push/Dispatch detected but no new upstream tags. Rebuilding newest tag: $ABSOLUTE_LATEST_DOWNSTREAM"
+              MISSING_TAGS=("$ABSOLUTE_LATEST_DOWNSTREAM")
             else
               echo "No new upstream versions missing. Exiting gracefully."
               echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
@@ -93,11 +106,11 @@ jobs:
             fi
           fi
 
-          # 5. Export JSON array and the absolute latest tag reference
+          # 5. Export JSON array and the absolute latest downstream tag reference
           JSON_ARRAY=$(printf '%s\n' "${MISSING_TAGS[@]}" | jq -R . | jq -s -c .)
           echo "Final matrix tags: $JSON_ARRAY"
           echo "missing_tags=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
-          echo "latest_tag=$ABSOLUTE_LATEST" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=$ABSOLUTE_LATEST_DOWNSTREAM" >> "$GITHUB_OUTPUT"
 
   # --- Job 2: Matrix Build & Push ---
   build:
@@ -109,6 +122,7 @@ jobs:
       packages: write
     strategy:
       matrix:
+        # The matrix tag here is the DOWNSTREAM format (e.g., 1.6.6-nonroot)
         tag: ${{ fromJson(needs.prepare.outputs.matrix_tags) }}
       fail-fast: false
 
@@ -116,17 +130,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract Minor Version for Tagging
+      - name: Process Tag Formats
         id: version_logic
         run: |
-          # Extracts "1.6" from "1.6.6-apache-nonroot"
+          # 1. Calculate Minor Tag (Extracts "1.6" from "1.6.6-nonroot")
           MINOR=$(echo "${{ matrix.tag }}" | grep -oE '^[0-9]+\.[0-9]+' || true)
-
           if [ -z "$MINOR" ]; then
             echo "minor_tag=${{ matrix.tag }}" >> "$GITHUB_OUTPUT"
           else
-            echo "minor_tag=${MINOR}-apache-nonroot" >> "$GITHUB_OUTPUT"
+            echo "minor_tag=${MINOR}-nonroot" >> "$GITHUB_OUTPUT"
           fi
+
+          # 2. Calculate Upstream Base Image Argument (Converts "1.6.6-nonroot" back to "1.6.6-apache-nonroot")
+          UPSTREAM_BUILD_ARG=$(echo "${{ matrix.tag }}" | sed 's/-nonroot/-apache-nonroot/')
+          echo "upstream_arg=$UPSTREAM_BUILD_ARG" >> "$GITHUB_OUTPUT"
 
       - name: Log in to Container registry
         uses: docker/login-action@v3
@@ -149,7 +166,6 @@ jobs:
           tags: |
             type=raw,value=${{ matrix.tag }}
             type=raw,value=${{ steps.version_logic.outputs.minor_tag }}
-            type=raw,value=latest-apache-nonroot,enable=${{ matrix.tag == needs.prepare.outputs.latest_tag }}
             type=raw,value=latest-nonroot,enable=${{ matrix.tag == needs.prepare.outputs.latest_tag }}
 
       - name: Build and push Docker image
@@ -160,7 +176,7 @@ jobs:
           push: true
           pull: true
           build-args: |
-            UPSTREAM_VERSION=${{ matrix.tag }}
+            UPSTREAM_VERSION=${{ steps.version_logic.outputs.upstream_arg }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ github.workflow }}-${{ matrix.tag }}
