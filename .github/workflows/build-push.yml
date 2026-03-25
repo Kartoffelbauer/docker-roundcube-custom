@@ -92,7 +92,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # Extract minor version string (e.g., '1.6' from '1.6.6') with a fallback
       - name: Extract minor version for tagging
