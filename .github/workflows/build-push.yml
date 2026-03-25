@@ -2,93 +2,121 @@ name: Build and Push
 
 on:
   schedule:
-    - cron: '0 3 * * 0' 
+    - cron: '0 3 * * 0'
   push:
     branches: [ "main" ]
     paths:
       - 'Dockerfile'
       - 'plugins/**'
   workflow_dispatch:
+    inputs:
+      force_tag:
+        description: 'Force build a specific tag (e.g. 1.6.6-nonroot)'
+        required: false
+        type: string
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
-  # --- Job 1: Preparation & Smart Check ---
+  # --- Job 1: Find Missing Versions ---
   prepare:
     runs-on: ubuntu-latest
     outputs:
       image_name: ${{ steps.set_vars.outputs.image_name }}
-      skip_build: ${{ steps.check.outputs.skip }}
-      upstream_digest: ${{ steps.check.outputs.upstream_digest }}
-      upstream_version: ${{ steps.check.outputs.upstream_version }}
-      upstream_minor_version: ${{ steps.check.outputs.upstream_minor_version }}
+      matrix_tags: ${{ steps.check.outputs.missing_tags }}
+      latest_tag: ${{ steps.check.outputs.latest_tag }}
     steps:
       - name: Calculate lowercase image name
         id: set_vars
         run: echo "image_name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Check if upstream base image updated
+      - name: Fetch and Compare Tags
         id: check
         run: |
-          UPSTREAM_IMAGE="docker://roundcube/roundcubemail:latest-nonroot"
-          OUR_IMAGE="docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }}:latest-nonroot"
-
-          # 1. Get current SHA256 digest of the official upstream image
-          UPSTREAM_DIGEST=$(skopeo inspect $UPSTREAM_IMAGE | jq -r '.Digest')
-
-          # 2. Extract the exact Roundcube version from the upstream image config
-          UPSTREAM_VERSION=$(skopeo inspect --config $UPSTREAM_IMAGE | jq -r '.config.Env[]? | select(startswith("ROUNDCUBEMAIL_VERSION=")) | split("=")[1]' | head -n 1)
-          
-          # Fallback to standard OCI label if the env var is missing, or default to "latest"
-          if [ -z "$UPSTREAM_VERSION" ]; then
-            UPSTREAM_VERSION=$(skopeo inspect $UPSTREAM_IMAGE | jq -r '.Labels["org.opencontainers.image.version"] // "latest"')
+          # 0. Handle manual force-build trigger
+          if [ "${{ github.event.inputs.force_tag }}" != "" ]; then
+            echo "Manual override detected. Building only: ${{ github.event.inputs.force_tag }}"
+            echo "missing_tags=[\"${{ github.event.inputs.force_tag }}\"]" >> "$GITHUB_OUTPUT"
+            # Do not tag forced legacy builds as 'latest-nonroot'
+            echo "latest_tag=none" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          
-          # 3. Extract the minor version (e.g., "1.6.6" becomes "1.6")
-          UPSTREAM_MINOR_VERSION=$(echo "$UPSTREAM_VERSION" | cut -d. -f1,2)
 
-          # 4. Get the label from our last build (fallback to 'none' on first run)
-          OUR_DIGEST=$(skopeo inspect --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} $OUR_IMAGE | jq -r '.Labels["upstream_base_digest"]' || echo "none")
+          # 1. Fetch Upstream Tags (Regex ensures only true semantic versions ending in -nonroot)
+          UPSTREAM_TAGS=$(skopeo list-tags docker://roundcube/roundcubemail | jq -r '.Tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$"))' | sort -V)
+          ABSOLUTE_LATEST=$(echo "$UPSTREAM_TAGS" | tail -n 1)
 
-          # 5. Compare digests. Skip only if they match AND it's a scheduled run.
-          if [ "$UPSTREAM_DIGEST" = "$OUR_DIGEST" ] && [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "No update found upstream. Skipping build."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          # 2. Fetch Our GHCR Tags (Using authenticated Skopeo, suppressing errors on first run)
+          OUR_TAGS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty' | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$")) | sort -V || true)
+
+          MISSING_TAGS=()
+
+          # 3. Apply the Versioning Logic
+          if [ -z "$OUR_TAGS" ]; then
+            echo "No previous builds found in GHCR. Building initial latest version: $ABSOLUTE_LATEST"
+            MISSING_TAGS+=("$ABSOLUTE_LATEST")
           else
-            echo "Update found or manual trigger! Building versions $UPSTREAM_VERSION and $UPSTREAM_MINOR_VERSION..."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            
-            # Export the variables securely using EOF
-            EOF1=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-            echo "upstream_digest<<$EOF1" >> "$GITHUB_OUTPUT"
-            echo "$UPSTREAM_DIGEST" >> "$GITHUB_OUTPUT"
-            echo "$EOF1" >> "$GITHUB_OUTPUT"
-            
-            EOF2=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-            echo "upstream_version<<$EOF2" >> "$GITHUB_OUTPUT"
-            echo "$UPSTREAM_VERSION" >> "$GITHUB_OUTPUT"
-            echo "$EOF2" >> "$GITHUB_OUTPUT"
-            
-            EOF3=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-            echo "upstream_minor_version<<$EOF3" >> "$GITHUB_OUTPUT"
-            echo "$UPSTREAM_MINOR_VERSION" >> "$GITHUB_OUTPUT"
-            echo "$EOF3" >> "$GITHUB_OUTPUT"
+            OLDEST_OUR_TAG=$(echo "$OUR_TAGS" | head -n 1)
+            echo "Oldest previously built version in GHCR is: $OLDEST_OUR_TAG"
+
+            for tag in $UPSTREAM_TAGS; do
+              # Determine if upstream tag is >= our oldest tag
+              LOWEST=$(echo -e "$tag\n$OLDEST_OUR_TAG" | sort -V | head -n 1)
+
+              if [ "$LOWEST" == "$OLDEST_OUR_TAG" ]; then
+                # Tag is in our valid window. Check if we haven't built it yet.
+                if ! echo "$OUR_TAGS" | grep -qx "$tag"; then
+                  echo "Queuing missing valid release: $tag"
+                  MISSING_TAGS+=("$tag")
+                fi
+              fi
+            done
           fi
 
-  # --- Job 2: Build & Push ---
+          # 4. Handle direct pushes to main (e.g., Dockerfile changes)
+          if [ ${#MISSING_TAGS[@]} -eq 0 ]; then
+            if [ "${{ github.event_name }}" == "push" ]; then
+              echo "Push detected but no new upstream tags. Rebuilding newest tag: $ABSOLUTE_LATEST"
+              MISSING_TAGS=("$ABSOLUTE_LATEST")
+            else
+              echo "No new upstream versions missing. Exiting gracefully."
+              echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # 5. Export JSON array and the absolute latest tag reference
+          JSON_ARRAY=$(printf '%s\n' "${MISSING_TAGS[@]}" | jq -R . | jq -s -c .)
+          echo "Final matrix tags: $JSON_ARRAY"
+          echo "missing_tags=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=$ABSOLUTE_LATEST" >> "$GITHUB_OUTPUT"
+
+  # --- Job 2: Matrix Build & Push ---
   build:
     needs: prepare
-    if: needs.prepare.outputs.skip_build == 'false'
+    if: needs.prepare.outputs.matrix_tags != '[]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        tag: ${{ fromJson(needs.prepare.outputs.matrix_tags) }}
+      fail-fast: false
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Log in to the Container registry
+      - name: Extract Minor Version for Tagging
+        id: version_logic
+        run: |
+          # Converts "1.6.6-nonroot" into "1.6-nonroot"
+          MINOR=$(echo "${{ matrix.tag }}" | grep -oE '^[0-9]+\.[0-9]+')
+          echo "minor_tag=${MINOR}-nonroot" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Container registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -101,15 +129,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract metadata (tags, labels) for Docker
+      - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.image_name }}
           tags: |
-            type=raw,value=latest-nonroot
-            type=raw,value=${{ needs.prepare.outputs.upstream_minor_version }}-nonroot
-            type=raw,value=${{ needs.prepare.outputs.upstream_version }}-nonroot
+            type=raw,value=${{ matrix.tag }}
+            type=raw,value=${{ steps.version_logic.outputs.minor_tag }}
+            type=raw,value=latest-nonroot,enable=${{ matrix.tag == needs.prepare.outputs.latest_tag }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -118,9 +146,9 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           pull: true
+          build-args: |
+            UPSTREAM_VERSION=${{ matrix.tag }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: |
-            ${{ steps.meta.outputs.labels }}
-            upstream_base_digest=${{ needs.prepare.outputs.upstream_digest }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ github.workflow }}-${{ matrix.tag }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ matrix.tag }}

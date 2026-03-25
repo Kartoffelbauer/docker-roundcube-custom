@@ -1,4 +1,6 @@
-FROM roundcube/roundcubemail:latest-nonroot
+# Default to latest-nonroot if no ARG is passed, but the workflow will provide it
+ARG UPSTREAM_VERSION=latest-nonroot
+FROM roundcube/roundcubemail:${UPSTREAM_VERSION}
 
 # Switch to the root user to install necessary system packages.
 USER root
@@ -24,7 +26,7 @@ RUN --mount=type=bind,source=./plugins/password/localization,target=/host_locale
     cat /host_locales/fr_FR.inc >> /usr/src/roundcubemail/plugins/password/localization/fr_FR.inc
 
 # --- Docker Race-Condition Workaround ---
-# This sed command extracts the composer block into the hold space, deletes it from the original location, 
+# This sed command extracts the composer block into the hold space, deletes it from the original location,
 # and pastes it back right before the database initialization sequence.
 RUN sed -i \
   -e '/if \[ ! -z "${ROUNDCUBEMAIL_COMPOSER_PLUGINS}" \]; then/,/if \[ ! -e config\/config.inc.php \]; then/{ /if \[ ! -e config\/config.inc.php \]; then/!{ H; d; } }' \
