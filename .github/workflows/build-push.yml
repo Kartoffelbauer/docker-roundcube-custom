@@ -63,7 +63,7 @@ jobs:
           # Override matrix with manual input if provided
           if [ -n "$FORCE_TAG" ]; then
             echo "missing_tags=[\"$FORCE_TAG\"]" >> "$GITHUB_OUTPUT"
-            echo "latest_tag=none" >> "$GITHUB_OUTPUT"
+            echo "latest_tag=$ABSOLUTE_LATEST" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
