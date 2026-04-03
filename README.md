@@ -9,6 +9,7 @@ This custom image modifies the base Roundcube image with the following additions
 * **Server-Side Spellcheck:** Installs `aspell` along with English and German dictionaries (`aspell-en`, `aspell-de`).
 * **Custom Password Driver:** Injects a custom Gandi password driver along with localization files for multiple languages (de_DE, de_CH, en_US, en_GB, en_CA, fr_FR).
 * **Entrypoint Fix:** Includes a `sed` workaround in the entrypoint script to prevent a race condition between composer plugins and database initialization.
+* **Silent Healthcheck Endpoint:** Implements a dedicated `/healthz` endpoint at the Apache level that bypasses the PHP interpreter and disables access logging.
 
 ## Automated Builds
 
@@ -27,3 +28,4 @@ services:
   roundcube:
     image: ghcr.io/Kartoffelbauer/docker-roundcube-custom:latest-nonroot
     # Rest of the configuration...
+```

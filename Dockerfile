@@ -2,7 +2,7 @@
 ARG UPSTREAM_VERSION=latest-nonroot
 FROM roundcube/roundcubemail:${UPSTREAM_VERSION}
 
-# Switch to the root user to install necessary system packages.
+# Switch to the root user to install necessary system packages and modify configs.
 USER root
 
 # Update package lists, install aspell and its language packs, then clean up.
@@ -32,6 +32,16 @@ RUN sed -i \
   -e '/if \[ ! -z "${ROUNDCUBEMAIL_COMPOSER_PLUGINS}" \]; then/,/if \[ ! -e config\/config.inc.php \]; then/{ /if \[ ! -e config\/config.inc.php \]; then/!{ H; d; } }' \
   -e '/# initialize or update DB/{ x; p; x; }' \
   /docker-entrypoint.sh
+
+# --- Silent Layer 7 Healthcheck Configuration ---
+# 1. Create a static text file to bypass the PHP interpreter
+# 2. Tell Apache to assign a 'dontlog' variable if the URI is '/healthz'
+# 3. Modify the CustomLog directive to ignore 'dontlog' requests
+RUN echo "OK" > /usr/src/roundcubemail/healthz && \
+    chown 1000:1000 /usr/src/roundcubemail/healthz && \
+    echo 'SetEnvIf Request_URI "^/healthz$" dontlog' > /etc/apache2/conf-available/silent-healthcheck.conf && \
+    a2enconf silent-healthcheck && \
+    sed -i 's|\(CustomLog .*\)|\1 env=!dontlog|g' /etc/apache2/sites-available/000-default.conf
 
 # Switch back to the default unprivileged user for security and portability.
 USER 1000
