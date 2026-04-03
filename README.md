@@ -21,11 +21,14 @@ The build process is fully automated via GitHub Actions (`build-push.yml`) using
 
 ## Usage
 
-You can pull the latest image directly from the GitHub Container Registry:
+You can pull the latest image directly from the GitHub Container Registry. To take full advantage of the silent logs, configure your Docker healthcheck to target the `/healthz` endpoint:
 
 ```yaml
 services:
   roundcube:
     image: ghcr.io/Kartoffelbauer/docker-roundcube-custom:latest-nonroot
-    # Rest of the configuration...
+    healthcheck:
+      test: "curl -sfL http://127.0.0.1:8000/healthz || exit 1"
+
+    # Rest of your configuration (environment, volumes, etc.)...
 ```
