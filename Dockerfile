@@ -34,13 +34,22 @@ RUN sed -i \
   /docker-entrypoint.sh
 
 # --- Silent Layer 7 Healthcheck Configuration ---
-# 1. Create a static text file to bypass the PHP interpreter (placed in public_html)
-# 2. Tell Apache to assign a 'dontlog' variable if the URI is '/healthz'
-# 3. Modify the CustomLog directive to ignore 'dontlog' requests
-RUN echo "OK" > /usr/src/roundcubemail/public_html/healthz && \
-    chown 1000:1000 /usr/src/roundcubemail/public_html/healthz && \
-    echo 'SetEnvIf Request_URI "^/healthz$" dontlog' > /etc/apache2/conf-available/silent-healthcheck.conf && \
-    a2enconf silent-healthcheck && \
+# 1. Create the isolated health file
+RUN mkdir -p /var/www/health && \
+    echo "OK" > /var/www/health/healthz && \
+    chown -R 1000:1000 /var/www/health
+
+# 2. Inject Apache config using Docker's modern heredoc syntax
+COPY <<EOF /etc/apache2/conf-available/silent-healthcheck.conf
+Alias /healthz /var/www/health/healthz
+<Location /healthz>
+    Require all granted
+    SetEnv dontlog
+</Location>
+EOF
+
+# 3. Enable the config and update the default site
+RUN a2enconf silent-healthcheck && \
     sed -i 's|\(CustomLog .*\)|\1 env=!dontlog|g' /etc/apache2/sites-available/000-default.conf
 
 # Switch back to the default unprivileged user for security and portability.
