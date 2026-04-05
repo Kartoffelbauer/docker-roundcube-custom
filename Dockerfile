@@ -35,11 +35,9 @@ RUN sed -i \
 
 # --- Silent Layer 7 Healthcheck Configuration ---
 # 1. Inject Apache config using Docker's modern heredoc syntax
-#    and map the URI outside the Roundcube directory
 COPY <<EOF /etc/apache2/conf-available/silent-healthcheck.conf
 Alias /healthz /var/www/health/healthz
 
-# Grant access bypassing any strict .htaccess rules
 <Location /healthz>
     Require all granted
 </Location>
@@ -49,7 +47,7 @@ EOF
 RUN mkdir -p /var/www/health && echo "OK" > /var/www/health/healthz && \
     a2enconf silent-healthcheck && \
     rm -f /etc/apache2/conf-enabled/other-vhosts-access-log.conf && \
-    sed -i 's|CustomLog .*|CustomLog ${APACHE_LOG_DIR}/access.log combined "expr=%{REQUEST_URI} != '\''/healthz'\''"|g' /etc/apache2/sites-enabled/000-default.conf
+    sed -i 's|CustomLog .*|CustomLog ${APACHE_LOG_DIR}/access.log combined "expr=%{REQUEST_URI} != '\''/healthz'\''"|g' /etc/apache2/sites-*/000-default.conf
 
 # Switch back to the default unprivileged user for security and portability.
 USER 1000
