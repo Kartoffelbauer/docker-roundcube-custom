@@ -33,14 +33,11 @@ RUN sed -i \
   -e '/# initialize or update DB/{ x; p; x; }' \
   /docker-entrypoint.sh
 
-## --- Silent Layer 7 Healthcheck Configuration ---
+# --- Silent Layer 7 Healthcheck Configuration ---
 # 1. Inject Apache config using Docker's modern heredoc syntax
+#    and map the URI outside the Roundcube directory
 COPY <<EOF /etc/apache2/conf-available/silent-healthcheck.conf
-# Map the URI outside the Roundcube directory
 Alias /healthz /var/www/health/healthz
-
-# Use SetEnvIf to reliably catch the URI early and suppress logging
-SetEnvIf Request_URI "^/healthz$" dontlog
 
 # Grant access bypassing any strict .htaccess rules
 <Location /healthz>
@@ -48,10 +45,11 @@ SetEnvIf Request_URI "^/healthz$" dontlog
 </Location>
 EOF
 
-# 2. Create the file, enable the config, and patch the access log in a single layer
+# 2. Create file, enable config, nuke ghost loggers, and use strict Log Expressions
 RUN mkdir -p /var/www/health && echo "OK" > /var/www/health/healthz && \
     a2enconf silent-healthcheck && \
-    sed -i 's|\(CustomLog .*\)|\1 env=!dontlog|g' /etc/apache2/sites-available/000-default.conf
+    rm -f /etc/apache2/conf-enabled/other-vhosts-access-log.conf && \
+    sed -i 's|CustomLog .*|CustomLog ${APACHE_LOG_DIR}/access.log combined "expr=%{REQUEST_URI} != '\''/healthz'\''"|g' /etc/apache2/sites-available/000-default.conf
 
 # Switch back to the default unprivileged user for security and portability.
 USER 1000
