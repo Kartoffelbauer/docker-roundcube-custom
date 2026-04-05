@@ -49,7 +49,7 @@ EOF
 RUN mkdir -p /var/www/health && echo "OK" > /var/www/health/healthz && \
     a2enconf silent-healthcheck && \
     rm -f /etc/apache2/conf-enabled/other-vhosts-access-log.conf && \
-    sed -i 's|CustomLog .*|CustomLog ${APACHE_LOG_DIR}/access.log combined "expr=%{REQUEST_URI} != '\''/healthz'\''"|g' /etc/apache2/sites-available/000-default.conf
+    sed -i 's|CustomLog .*|CustomLog ${APACHE_LOG_DIR}/access.log combined "expr=%{REQUEST_URI} != '\''/healthz'\''"|g' /etc/apache2/sites-enabled/000-default.conf
 
 # Switch back to the default unprivileged user for security and portability.
 USER 1000
