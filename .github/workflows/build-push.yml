@@ -2,19 +2,20 @@ name: Build and Push
 
 on:
   schedule:
-    - cron: '0 3 * * 0'
+    - cron: '0 3 * * 0' # Weekly sync on Sunday
   push:
     branches: [ "main" ]
     paths:
       - 'Dockerfile'
       - 'plugins/**'
-  workflow_dispatch:
+  workflow_dispatch: # Allow manual triggering
 
 env:
   REGISTRY: ghcr.io
 
 jobs:
   prepare:
+    name: Calculate Build Matrix
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -24,6 +25,7 @@ jobs:
       matrix_tags: ${{ steps.check.outputs.missing_tags }}
       latest_tag: ${{ steps.check.outputs.latest_tag }}
       highest_minors: ${{ steps.check.outputs.highest_minors }}
+
     steps:
       # GHCR requires repository namespaces to be strictly lowercase
       - name: Calculate lowercase image name
@@ -33,52 +35,80 @@ jobs:
       - name: Calculate build matrix
         id: check
         run: |
-          # Extract pure semantic versions from upstream target tags
-          UPSTREAM_VERSIONS=$(skopeo list-tags docker://roundcube/roundcubemail | jq -r '.Tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-apache-nonroot$")) | sub("-apache-nonroot$"; "")' | sort -V)
+          set -e # Fail fast on unexpected errors
+
+          # 1. Fetch Upstream Versions (Roundcube)
+          # Extract pure semantic versions from upstream target tags, targeting apache-nonroot
+          UPSTREAM_VERSIONS=$(skopeo list-tags docker://roundcube/roundcubemail | \
+            jq -r '.Tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-apache-nonroot$")) | sub("-apache-nonroot$"; "")' | \
+            sort -V)
 
           if [ -z "$UPSTREAM_VERSIONS" ]; then
-            echo "Error: No valid upstream tags found."
+            echo "::error::No valid upstream tags found."
             echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
             echo "highest_minors=[]" >> "$GITHUB_OUTPUT"
             echo "latest_tag=none" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          # 2. Determine Key Version Metrics
           ABSOLUTE_LATEST=$(echo "$UPSTREAM_VERSIONS" | tail -n 1)
 
-          # Map the highest patch for each minor version to prevent race conditions during parallel matrix tagging
-          HIGHEST_MINORS=$(echo "$UPSTREAM_VERSIONS" | awk -F. '{minor=$1"."$2; map[minor]=$0} END {for (i in map) print map[i]}' | sort -V)
+          # Map the highest patch for each minor version (e.g., maps 1.6.x to 1.6)
+          # This prevents race conditions during parallel matrix tagging and dictates our core supported versions
+          HIGHEST_MINORS=$(echo "$UPSTREAM_VERSIONS" | \
+            awk -F. '{minor=$1"."$2; map[minor]=$0} END {for (i in map) print map[i]}' | sort -V)
           HIGHEST_MINORS_JSON=$(printf '%s\n' $HIGHEST_MINORS | jq -R . | jq -s -c .)
 
-          # Fetch local versions, suppressing errors on the initial run when the registry is empty
-          OUR_VERSIONS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$")) | sub("-nonroot$"; "")' | sort -V || true)
+          # 3. Fetch Local Versions (Our Registry)
+          # Suppress errors on the initial run when the registry is empty
+          OUR_VERSIONS=$(skopeo list-tags docker://${{ env.REGISTRY }}/${{ steps.set_vars.outputs.image_name }} \
+            --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} 2>/dev/null | \
+            jq -r '.Tags[]? // empty | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+-nonroot$")) | sub("-nonroot$"; "")' | \
+            sort -V || true)
 
-          MISSING_VERSIONS=()
+          # 4. Calculate Required Builds using an Associative Array for deduplication
+          declare -A BUILD_MATRIX
 
-          # Identify versions not yet mirrored
+          # A) Identify versions not yet mirrored
           for up_ver in $UPSTREAM_VERSIONS; do
             if ! echo "$OUR_VERSIONS" | grep -qx "$up_ver"; then
-              MISSING_VERSIONS+=("$up_ver")
+              BUILD_MATRIX["$up_ver"]=1
             fi
           done
 
-          # Rebuild active minor releases if the source code (Dockerfile/plugins) changes
-          if [ ${#MISSING_VERSIONS[@]} -eq 0 ]; then
-            if [ "${{ github.event_name }}" == "push" ]; then
-              MISSING_VERSIONS=($HIGHEST_MINORS)
-            else
-              echo "Repository is perfectly synced. Exiting gracefully."
-              echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+          # B) Force rebuild on 'push' or 'workflow_dispatch' events
+          # If the Dockerfile or plugins changed, we MUST rebuild the active branches,
+          # even if they are already mirrored.
+          if [[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "Trigger event '${{ github.event_name }}' detected. Forcing rebuild of active minor releases..."
+            for minor_ver in $HIGHEST_MINORS; do
+              BUILD_MATRIX["$minor_ver"]=1
+            done
           fi
 
-          JSON_ARRAY=$(printf '%s\n' "${MISSING_VERSIONS[@]}" | jq -R . | jq -s -c .)
+          # 5. Finalize Matrix
+          if [ ${#BUILD_MATRIX[@]} -eq 0 ]; then
+            echo "Repository is perfectly synced and no forced rebuild is required. Exiting gracefully."
+            echo "missing_tags=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Extract unique versions and sort them cleanly
+          MISSING_VERSIONS=("${!BUILD_MATRIX[@]}")
+          IFS=$'\n' SORTED_VERSIONS=($(sort -V <<<"${MISSING_VERSIONS[*]}"))
+          unset IFS
+
+          # Serialize to JSON array for the matrix strategy
+          JSON_ARRAY=$(printf '%s\n' "${SORTED_VERSIONS[@]}" | jq -R . | jq -s -c .)
+
+          echo "Versions queued for build: $JSON_ARRAY"
           echo "missing_tags=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
           echo "highest_minors=$HIGHEST_MINORS_JSON" >> "$GITHUB_OUTPUT"
           echo "latest_tag=$ABSOLUTE_LATEST" >> "$GITHUB_OUTPUT"
 
   build:
+    name: Build & Push Images
     needs: prepare
     if: needs.prepare.outputs.matrix_tags != '[]'
     runs-on: ubuntu-latest
@@ -88,13 +118,13 @@ jobs:
     strategy:
       matrix:
         version: ${{ fromJson(needs.prepare.outputs.matrix_tags) }}
-      fail-fast: false
+      fail-fast: false # Prevent one failing version build from cancelling the others
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      # Extract minor version string (e.g., '1.6' from '1.6.6') with a fallback
+      # Extract minor version string (e.g., '1.6' from '1.6.6') with a fallback to raw matrix version
       - name: Extract minor version for tagging
         id: version_logic
         run: |
@@ -114,7 +144,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # Conditionally apply 'latest' and minor tags only to their respective highest versions
+      # Smart Tagging:
+      # - Always applies full semantic tag (e.g., 1.6.6-nonroot)
+      # - Applies minor tag (1.6-nonroot) ONLY if it's the highest patch of that minor
+      # - Applies latest tag (latest-nonroot) ONLY if it's the absolute highest version
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v6
