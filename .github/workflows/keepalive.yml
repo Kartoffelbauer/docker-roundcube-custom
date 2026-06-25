@@ -1,0 +1,52 @@
+name: Keepalive
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  keepalive:
+    name: Native API Keepalive Ping
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Re-enable Scheduled Workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Strict Bash Execution:
+          # -e: Exit immediately on command failure
+          # -u: Treat unset variables as errors
+          # -o pipefail: Catch failures within piped commands
+          set -euo pipefail
+
+          # DRY Implementation: Array of workflows to maintain.
+          # CRITICAL: The keepalive workflow MUST refresh itself.
+          WORKFLOWS=(
+            "build-push.yml"
+            "keepalive.yml"
+          )
+
+          echo "Starting API keepalive sequence for repository: ${REPO}"
+
+          for workflow in "${WORKFLOWS[@]}"; do
+            echo "=> Pinging enable endpoint for: ${workflow}"
+
+            # Execute REST API call. Re-enabling an active workflow returns 204 No Content
+            # and successfully resets the internal 60-day inactivity timer.
+            gh api \
+              --silent \
+              --method PUT \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${REPO}/actions/workflows/${workflow}/enable"
+
+            echo "   Success: ${workflow} schedule refreshed."
+          done
+
+          echo "Keepalive sequence completed successfully."
